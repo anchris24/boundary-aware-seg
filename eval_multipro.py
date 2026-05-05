@@ -19,7 +19,30 @@ from mit_semseg.lib.utils import as_numpy
 from PIL import Image
 from tqdm import tqdm
 
-colors = loadmat('data/color150.mat')['colors']
+color_path = 'data/color150.mat'
+if os.path.exists(color_path):
+    colors = loadmat(color_path)['colors']
+else:
+    colors = np.stack([
+        np.array([
+            (i * 37) % 255,
+            (i * 17) % 255,
+            (i * 29) % 255,
+        ], dtype=np.uint8)
+        for i in range(150)
+    ])
+
+
+def move_to_device(obj, device):
+    if torch.is_tensor(obj):
+        return obj.to(device, non_blocking=device.type == 'cuda')
+    if isinstance(obj, dict):
+        return {k: move_to_device(v, device) for k, v in obj.items()}
+    if isinstance(obj, tuple):
+        return tuple(move_to_device(v, device) for v in obj)
+    if isinstance(obj, list):
+        return [move_to_device(v, device) for v in obj]
+    return obj
 
 
 def visualize_result(data, pred, dir_result):
@@ -39,7 +62,7 @@ def visualize_result(data, pred, dir_result):
     Image.fromarray(im_vis).save(os.path.join(dir_result, img_name.replace('.jpg', '.png')))
 
 
-def evaluate(segmentation_module, loader, cfg, gpu_id, result_queue):
+def evaluate(segmentation_module, loader, cfg, device, result_queue):
     segmentation_module.eval()
 
     for batch_data in loader:
@@ -50,15 +73,14 @@ def evaluate(segmentation_module, loader, cfg, gpu_id, result_queue):
 
         with torch.no_grad():
             segSize = (seg_label.shape[0], seg_label.shape[1])
-            scores = torch.zeros(1, cfg.DATASET.num_class, segSize[0], segSize[1])
-            scores = async_copy_to(scores, gpu_id)
+            scores = torch.zeros(1, cfg.DATASET.num_class, segSize[0], segSize[1], device=device)
 
             for img in img_resized_list:
                 feed_dict = batch_data.copy()
                 feed_dict['img_data'] = img
                 del feed_dict['img_ori']
                 del feed_dict['info']
-                feed_dict = async_copy_to(feed_dict, gpu_id)
+                feed_dict = move_to_device(feed_dict, device)
 
                 # forward pass
                 scores_tmp = segmentation_module(feed_dict, segSize=segSize)
@@ -70,7 +92,8 @@ def evaluate(segmentation_module, loader, cfg, gpu_id, result_queue):
         # calculate accuracy and SEND THEM TO MASTER
         acc, pix = accuracy(pred, seg_label)
         intersection, union = intersectionAndUnion(pred, seg_label, cfg.DATASET.num_class)
-        result_queue.put_nowait((acc, pix, intersection, union))
+        if result_queue is not None:
+            result_queue.put_nowait((acc, pix, intersection, union))
 
         # visualization
         if cfg.VAL.visualize:
@@ -81,8 +104,9 @@ def evaluate(segmentation_module, loader, cfg, gpu_id, result_queue):
             )
 
 
-def worker(cfg, gpu_id, start_idx, end_idx, result_queue):
-    torch.cuda.set_device(gpu_id)
+def worker(cfg, gpu_id, start_idx, end_idx, result_queue, device):
+    if device.type == 'cuda':
+        torch.cuda.set_device(gpu_id)
 
     # Dataset and Loader
     dataset_val = ValDataset(
@@ -92,10 +116,10 @@ def worker(cfg, gpu_id, start_idx, end_idx, result_queue):
         start_idx=start_idx, end_idx=end_idx)
     loader_val = torch.utils.data.DataLoader(
         dataset_val,
-        batch_size=cfg.VAL.batch_size,
+        batch_size=getattr(cfg.VAL, 'batch_size', 1),
         shuffle=False,
         collate_fn=user_scattered_collate,
-        num_workers=2)
+        num_workers=0 if device.type != 'cuda' else 2)
 
     # Network Builders
     net_encoder = ModelBuilder.build_encoder(
@@ -113,10 +137,10 @@ def worker(cfg, gpu_id, start_idx, end_idx, result_queue):
 
     segmentation_module = SegmentationModule(net_encoder, net_decoder, crit)
 
-    segmentation_module.cuda()
+    segmentation_module.to(device)
 
     # Main loop
-    evaluate(segmentation_module, loader_val, cfg, gpu_id, result_queue)
+    evaluate(segmentation_module, loader_val, cfg, device, result_queue)
 
 
 def main(cfg, gpus):
@@ -124,20 +148,52 @@ def main(cfg, gpus):
         lines = f.readlines()
         num_files = len(lines)
 
-    num_files_per_gpu = math.ceil(num_files / len(gpus))
-
     pbar = tqdm(total=num_files)
 
     acc_meter = AverageMeter()
     intersection_meter = AverageMeter()
     union_meter = AverageMeter()
 
+    if not hasattr(cfg.VAL, 'batch_size'):
+        cfg.VAL.batch_size = 1
+
+    use_cuda = torch.cuda.is_available() and len(gpus) > 0
+    if not use_cuda:
+        device = torch.device('mps' if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() else 'cpu')
+        result_queue = Queue(500)
+        worker(cfg, -1, 0, num_files, result_queue, device)
+
+        processed_counter = 0
+        while processed_counter < num_files:
+            if result_queue.empty():
+                continue
+            (acc, pix, intersection, union) = result_queue.get()
+            acc_meter.update(acc, pix)
+            intersection_meter.update(intersection)
+            union_meter.update(union)
+            processed_counter += 1
+            pbar.update(1)
+
+        iou = intersection_meter.sum / (union_meter.sum + 1e-10)
+        for i, _iou in enumerate(iou):
+            print('class [{}], IoU: {:.4f}'.format(i, _iou))
+
+        print('[Eval Summary]:')
+        print('Mean IoU: {:.4f}, Accuracy: {:.2f}%'
+              .format(iou.mean(), acc_meter.average()*100))
+
+        print('Evaluation Done!')
+        return
+
+    num_files_per_gpu = math.ceil(num_files / len(gpus))
+
     result_queue = Queue(500)
     procs = []
     for idx, gpu_id in enumerate(gpus):
         start_idx = idx * num_files_per_gpu
         end_idx = min(start_idx + num_files_per_gpu, num_files)
-        proc = Process(target=worker, args=(cfg, gpu_id, start_idx, end_idx, result_queue))
+        device = torch.device('cuda', gpu_id)
+        proc = Process(target=worker, args=(cfg, gpu_id, start_idx, end_idx, result_queue, device))
         print('gpu:{}, start_idx:{}, end_idx:{}'.format(gpu_id, start_idx, end_idx))
         proc.start()
         procs.append(proc)
